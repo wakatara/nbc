@@ -19,6 +19,116 @@ use tokio::{
     time::sleep,
 };
 
+
+#[tokio::main]
+async fn main() {
+    pretty_env_logger::init();
+
+    // Initialize keypair, libp2p transport, behaviour, and p2p Swarm
+    info!("Peer Id: {}", p2p::PEER_ID.clone());
+    let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
+    let (init_sender, mut init_rcv) = mpsc::unbounded_channel();
+
+    let auth_keys = Keypair::::new()
+        .into_authentic(&p2p::KEYS)
+        .expect("can create auth keys");
+
+    let transp = TokioTcpConfig::new()
+        .upgrade(upgrade::Version::V1)
+        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated())
+        .multiplex(mplex::MplexConfig::new())
+        .boxed();
+
+    let behaviour = p2p::AppBehaviour::new(App::new(), response_sender, init_sender.clone()).await;
+
+    let mut swarm = SwarmBuilder::new(transp, behaviour, *p2p::PEER_ID)
+        .executor(Box::new(|fut| {
+            spawn(fut);
+        }))
+        .build();
+
+    // buffered reader on StdIn     
+    let mut stdin = BufReader::new(stdin()).lines();
+
+    Swarm::listen_on(
+        &mut swarm,
+        "/ip4/0.0.0.0/tcp/0"
+            .parse()
+            .expect("can get a local socket"),
+    )
+    .expect("swarm can be started");
+
+    // Spawn async coroutine: waits and sends init trigger on init channel
+    spawn(async move {
+        sleep(Duration::from_secs(1)).await;
+        info!("sending init event");
+        init_sender.send(true).expect("can send init event");
+    });
+
+    // user events, incoming and outgoing data
+    loop {
+        let evt = {
+            // Tokio's select! macro to race multiple async functions
+            select! {
+                line = stdin.next_line() => Some(p2p::EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
+                response = response_rcv.recv() => {
+                    Some(p2p::EventType::LocalChainResponse(response.expect("response exists")))
+                },
+                _init = init_rcv.recv() => {
+                    Some(p2p::EventType::Init)
+                }
+                event = swarm.select_next_some() => {
+                    info!("Unhandled Swarm Event: {:?}", event);
+                    None
+                },
+            }
+        };
+
+        if let Some(event) = evt {
+            match event {
+                p2p::EventType::Init => {
+                    let peers = p2p::get_list_peers(&swarm);
+                    swarm.behaviour_mut().app.genesis();
+
+                    info!("connected nodes: {}", peers.len());
+                    if !peers.is_empty() {
+                        let req = p2p::LocalChainRequest {
+                            from_peer_id: peers
+                                .iter()
+                                .last()
+                                .expect("at least one peer")
+                                .to_string(),
+                        };
+
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+                        swarm
+                            .behaviour_mut()
+                            .floodsub
+                            .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
+                    }
+                }
+                p2p::EventType::LocalChainResponse(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonify response");
+                    swarm
+                        .behaviour_mut()
+                        .floodsub
+                        .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
+                }
+                // Just 3 commands
+                // ls p - prints all peers
+                // ls c - prints the chain locally 
+                // create b $data makes a block
+                p2p::EventType::Input(line) => match line.as_str() {
+                    "ls p" => p2p::handle_print_peers(&swarm),
+                    cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm),
+                    cmd if cmd.starts_with("create b") => p2p::handle_create_block(cmd, &mut swarm),
+                    _ => error!("unknown command"),
+                },
+            }
+        }
+    }
+
+
 // Mining scheme - increases by more lead zeros
 // Normally in non-naive impl would be set by network 
 // attrib off consensus algo for consistent time-to-complete
@@ -156,6 +266,7 @@ impl App {
 }
 
 impl Block {
+
     pub fn new(id: u64, previous_hash: String, data: String) -> Self {
         let now = Utc::now();
         let (nonce, hash) = mine_block(id, now.timestamp(), &previous_hash, &data);
@@ -168,43 +279,46 @@ impl Block {
             nonce,
         }
     }
-}
 
-fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String) {
-    info!("mining block...");
-    let mut nonce = 0;
+    fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String) {
+        info!("mining block...");
+        let mut nonce = 0;
 
-    // loop till we get a block that starts with two 00's
-    loop {
-        if nonce % 100000 == 0 {
-            info!("nonce: {}", nonce);
+        // loop till we get a block that starts with two 00's
+        loop {
+            if nonce % 100000 == 0 {
+                info!("nonce: {}", nonce);
+            }
+            let hash = calculate_hash(id, timestamp, previous_hash, data, nonce);
+            let binary_hash = hash_to_binary_representation(&hash);
+            if binary_hash.starts_with(DIFFICULTY_PREFIX) {
+                info!(
+                    "mined! nonce: {}, hash: {}, binary hash: {}",
+                    nonce,
+                    hex::encode(&hash),
+                    binary_hash
+                );
+                return (nonce, hex::encode(hash));
+            }
+            nonce += 1;
         }
-        let hash = calculate_hash(id, timestamp, previous_hash, data, nonce);
-        let binary_hash = hash_to_binary_representation(&hash);
-        if binary_hash.starts_with(DIFFICULTY_PREFIX) {
-            info!(
-                "mined! nonce: {}, hash: {}, binary hash: {}",
-                nonce,
-                hex::encode(&hash),
-                binary_hash
-            );
-            return (nonce, hex::encode(hash));
-        }
-        nonce += 1;
     }
+
+    fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonce: u64) -> Vec<u8> {
+        let data = serde_json::json!({
+            "id": id,
+            "previous_hash": previous_hash,
+            "data": data,
+            "timestamp": timestamp,
+            "nonce": nonce
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(data.to_string().as_bytes());
+        hasher.finalize().as_slice().to_owned()
+    }
+
 }
 
-fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonce: u64) -> Vec<u8> {
-    let data = serde_json::json!({
-        "id": id,
-        "previous_hash": previous_hash,
-        "data": data,
-        "timestamp": timestamp,
-        "nonce": nonce
-    });
-    let mut hasher = Sha256::new();
-    hasher.update(data.to_string().as_bytes());
-    hasher.finalize().as_slice().to_owned()
-}
+
 
 
