@@ -29,7 +29,7 @@ use `create b HODL_to_the_Moon_FTW!` or similar start to kick off mining a block
 - [] Ramp up difficulty level to represent controlled inflation as chain gets longer
 - [] TODO Quiet the INFO print out matches to drop unhandled but know messages
 - [] Reimplement in Golang to check ease and performance if each (GC etc.)
-- 
+- [] In particular, implement without Rust's p2plib crate which does all heavy lifting here (Golang version?)
   
 
 
